@@ -1,0 +1,22 @@
+[package]
+name = "codex-switch"
+version = "0.1.0"
+edition = "2021"
+description = "Snapshot and switch Codex auth.json + config.toml profiles"
+license = "MIT"
+
+[[bin]]
+name = "codex-switch"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "5"
+anyhow = "1"
+
+[profile.release]
+strip = true
+opt-level = "z"
+lto = true
