@@ -10,11 +10,13 @@ without disturbing the rest of the live config. Each **profile** is a *layer*
 owning only:
 
 - `auth.json` (optional, OpenAI/ChatGPT credentials),
-- `provider.toml` — a TOML fragment of the managed top-level keys
-  (`model`, `model_provider`, `model_catalog_json`) plus the active
+- `config.provider.toml` — a TOML fragment of the managed top-level keys
+  (`model`, `model_provider`, `model_catalog_json`, `review_model`) plus the
+  active
   `[model_providers.<id>]` table,
-- `model-catalog.json` (optional), installed into `$CODEX_HOME/catalogs/`
-  and pointed at by `model_catalog_json` on apply.
+- `model-catalog.json` (optional), read *in place* from the profile
+  directory: on apply `model_catalog_json` is repointed at
+  `<store>/profiles/<name>/model-catalog.json`. No install copy elsewhere.
 
 Switching **merges** the fragment into the current live `config.toml` with
 `toml_edit`, so settings the profile does not own — sandbox mode, approval
@@ -29,15 +31,16 @@ under `ref/cc-switch/` has all of that; we intentionally left it out.
 
 > Historical note: v0.1.0 was a whole-file snapshot tool (tag `v0.1.0`). v0.2.0
 > replaced snapshots with field-level layers; snapshot mode was intentionally
-> removed.
+> removed. The store shape is unchanged: one directory per profile under
+> `<store>/profiles/<name>/`.
 
 ## Layout
 
 ```
 src/
   main.rs      # clap CLI: list, current, use, save, import, diff, rm, paths
-  paths.rs     # resolve live files (CODEX_HOME), catalogs dir, store (fallback)
-  profile.rs   # layer capture/merge (toml_edit), catalog install, rollback, remove
+  paths.rs     # resolve live files (CODEX_HOME) and store (with fallback)
+  profile.rs   # layer capture/merge (toml_edit), rollback, remove
   state.rs     # state.json (active profile) + profile-name validation
   atomic.rs    # atomic_write: temp file in same dir -> rename, perms handling
 ref/cc-switch/ # read-only reference (the Tauri app this is inspired by). Do not edit.
@@ -49,27 +52,31 @@ ref/cc-switch/ # read-only reference (the Tauri app this is inspired by). Do not
   in the *same directory*, then `rename`). Never write a target path in place.
   Same-directory temp keeps the rename on one filesystem and symlink-safe.
 - **Layer, not snapshot.** A profile only touches the managed keys
-  (`model`, `model_provider`, `model_catalog_json`, and its own
+  (`model`, `model_provider`, `model_catalog_json`, `review_model`, and its own
   `[model_providers.<id>]` entry). `merge_fragment` must never rewrite or
   reorder unmanaged sections; it edits the live `DocumentMut` in place and
   leaves everything else (sandbox, approval, `[projects]` trust, MCP) intact.
   The `model_providers` map is merged per provider id so unrelated custom
   providers in live config are preserved.
-- **Catalog follows the profile.** A bundled `model-catalog.json` is installed
-  to `paths::catalog_path(name)` and `model_catalog_json` is set to that
-  absolute path on apply. Removing a profile also removes its installed catalog.
+- **Catalog lives in the profile.** A bundled `model-catalog.json` is stored
+  next to `config.provider.toml` inside the profile directory. On apply,
+  `model_catalog_json` is set to that absolute path — nothing is copied into
+  `$CODEX_HOME`. `rm` removes the profile directory and the catalog goes with
+  it.
 - **Paired write with rollback.** `auth.json` is written before `config.toml`;
-  if `config.toml` fails, `auth.json`, `config.toml`, and a freshly installed
-  catalog are restored to their pre-write bytes. See `profile::write_live`.
+  if `config.toml` fails, both are restored to their pre-write bytes. See
+  `profile::write_live`.
 - **`auth.json` is `0600`.** It holds credentials. `AUTH_MODE` enforces this on
-  every write, including profiles and backups.
+  every write, including profile copies.
 - **`None` means "remove".** A `None`/absent optional file in a layer means the
-  corresponding target file is removed (so an auth-less profile clears a stale
-  live `auth.json`). Catalog and `provider.toml` follow the same rule on write.
+  corresponding live file is removed (so an auth-less profile clears a stale
+  live `auth.json`). `config.provider.toml` and `model-catalog.json` follow the
+  same rule inside the profile directory.
 - **No auto-save.** Never auto-write live changes back into a profile. Drift is
   captured only by an explicit `save`/`import`.
-- **Backup before `use`.** Every `use` first copies live auth+config to
-  `<store>/backup/` (a full snapshot for manual recovery).
+- **No side backup.** `use` does not copy live files anywhere before writing.
+  Recovery is via `save`/`use` between profiles; rollback covers the failure
+  window of a single `use`.
 - **Name validation.** Profile names are directory names. Reject empty, `.`,
   `..`, and anything containing `/`, `\`, or NUL (`state::validate_profile_name`).
 

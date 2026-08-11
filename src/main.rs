@@ -130,15 +130,11 @@ fn cmd_use(name: &str) -> Result<()> {
     }
     let layer = profile::read_profile(name)?;
     if layer.is_empty() {
-        bail!("profile {name:?} has no auth.json, provider.toml, or model-catalog.json");
+        bail!("profile {name:?} has no auth.json, config.provider.toml, or model-catalog.json");
     }
 
     // Capture live before touching it so a later step can roll back.
     let previous_live = profile::capture_live()?;
-
-    if let Some(dir) = profile::backup_live()? {
-        eprintln!("backed up current live config to {}", dir.display());
-    }
 
     profile::write_live(name, &layer)?;
 
@@ -207,10 +203,10 @@ fn cmd_diff(name: Option<&str>) -> Result<()> {
     }
 
     let layer = profile::read_profile(&target)?;
-    let result = profile::diff_profile(&target, &layer)?;
-    println!("auth.json:         {}", status_label(&result.auth));
-    println!("provider.toml:     {}", status_label(&result.fragment));
-    println!("model-catalog.json: {}", status_label(&result.catalog));
+    let result = profile::diff_profile(&layer)?;
+    println!("auth.json:            {}", status_label(&result.auth));
+    println!("config.provider.toml: {}", status_label(&result.fragment));
+    println!("model-catalog.json:   {}", status_label(&result.catalog));
     if matches!(result.auth, FileStatus::Same)
         && matches!(result.fragment, FileStatus::Same)
         && matches!(result.catalog, FileStatus::Same)
@@ -238,7 +234,6 @@ fn cmd_paths() -> Result<()> {
     println!("codex home:   {}", paths::codex_home()?.display());
     println!("live auth:    {}", paths::codex_auth_path()?.display());
     println!("live config:  {}", paths::codex_config_path()?.display());
-    println!("catalogs dir: {}", paths::catalogs_dir()?.display());
     println!("store root:   {}", store.display());
     println!("store source: {source}");
     println!("profiles dir: {}", paths::profiles_dir()?.display());

@@ -21,11 +21,12 @@ applies provider layers.
 A profile is a directory under `<store>/profiles/<name>/` containing:
 
 - `auth.json` (optional) — OpenAI/ChatGPT credentials, always written `0600`.
-- `provider.toml` — a TOML fragment of the managed top-level keys:
-  `model`, `model_provider`, and the active `[model_providers.<id>]` table.
-- `model-catalog.json` (optional) — a model catalog installed into
-  `$CODEX_HOME/catalogs/<name>.json`; `model_catalog_json` is pointed at it on
-  apply.
+- `config.provider.toml` — a TOML fragment of the managed top-level keys:
+  `model`, `model_provider`, `review_model`, and the active
+  `[model_providers.<id>]` table.
+- `model-catalog.json` (optional) — a model catalog. On `use`, the live
+  `model_catalog_json` is repointed at this file inside the profile directory;
+  there is no side-copy under `$CODEX_HOME`.
 
 Everything else in `~/.codex/config.toml` — `sandbox_mode`, `approval_policy`,
 `[projects]` trust decisions, `[permissions]`, `mcp_servers`, ... — is **not**
@@ -34,19 +35,17 @@ stored and is left in place when you switch.
 ```
 ~/.codex/                      # the LIVE config that Codex actually reads
   auth.json
-  config.toml
-  catalogs/<name>.json         # per-profile model catalogs installed here
+  config.toml                  # model_catalog_json points into <store>/profiles/<name>/
 
-<store>/                       # codex-switch's storage
+<store>/                       # codex-switch's storage — one dir per profile
   profiles/
     work/
       auth.json
-      provider.toml
+      config.provider.toml
     personal/
       auth.json
-      provider.toml
+      config.provider.toml
       model-catalog.json
-  backup/                      # last live auth+config, saved before each `use`
   state.json                   # { "active": "<profile>" }
 ```
 
@@ -66,23 +65,22 @@ stored and is left in place when you switch.
 - `import`/`save` read the live config and **extract** the managed keys plus the
   active `[model_providers.<id>]` table. If `model_catalog_json` points at a
   readable file, that file is bundled into the profile and the path key is
-  dropped (it is re-pointed at the installed copy on `use`).
+  dropped (it is repointed at the profile's copy on `use`).
 - `use` parses the live `config.toml` with [`toml_edit`](https://crates.io/crates/toml_edit),
   merges the profile fragment over it (scalars replaced, `model_providers`
-  merged per provider id so unrelated custom providers survive), installs the
-  catalog, and writes it back atomically. `auth.json` is written first; if the
-  config write fails, auth, config, and the catalog are rolled back.
+  merged per provider id so unrelated custom providers survive), sets
+  `model_catalog_json` to the profile's `model-catalog.json` when the profile
+  bundles one, and writes the result back atomically. `auth.json` is written
+  first; if the config write fails, auth and config are rolled back.
 
 ### Safety properties
 
 - **Atomic writes.** Each file is written to a temp file in the same directory
   and then `rename`d over the target, so Codex never sees a half-written file.
 - **Paired write with rollback.** `auth.json` is written first, then
-  `config.toml`; if the second write fails, both (and a freshly installed
-  catalog) are restored to their pre-write bytes.
+  `config.toml`; if the second write fails both are restored to their
+  pre-write bytes.
 - **Least-privilege credentials.** `auth.json` is always written with `0600`.
-- **Automatic backup.** Before every `use`, the current live auth + config are
-  copied to `<store>/backup/`.
 - **Symlink-safe.** Works when `$HOME` or `~/.codex` is a symlink.
 - **No network.** This tool never contacts the network.
 
@@ -92,7 +90,6 @@ stored and is left in place when you switch.
 
 - `$CODEX_HOME/auth.json`
 - `$CODEX_HOME/config.toml`
-- `$CODEX_HOME/catalogs/` (installed per-profile catalogs)
 
 **The store** is resolved in this order:
 
@@ -115,6 +112,65 @@ cargo install --path .
 This installs a `codex-switch` binary into `~/.cargo/bin` (already on `PATH`
 with rustup). Re-run after pulling to update.
 
+## Creating a profile (manual)
+
+`codex-switch` intentionally has **no provider setup UI, no templates, no
+wizards** — its job is capture + apply. So the first profile has to be written
+by hand. There are two paths; pick one.
+
+### Path A — write the profile directory directly
+
+Create `<store>/profiles/<name>/config.provider.toml` with the managed keys
+for your provider. Minimal example for a DeepSeek-style OpenAI-compatible API:
+
+```toml
+# ~/.codex-switch/profiles/deepseek/config.provider.toml
+model = "deepseek-chat"
+model_provider = "deepseek"
+review_model = "deepseek-chat"
+
+[model_providers.deepseek]
+name = "DeepSeek"
+base_url = "https://api.deepseek.com"
+env_key = "DEEPSEEK_API_KEY"
+wire_api = "chat"
+```
+
+Then activate it:
+
+```sh
+codex-switch use deepseek
+```
+
+Notes:
+
+- The provider id (`deepseek` in `[model_providers.deepseek]`) **must match**
+  `model_provider`.
+- `base_url` should not have a trailing slash.
+- `wire_api` is `"chat"` for OpenAI-compatible `/chat/completions` endpoints,
+  or `"responses"` for OpenAI's Responses API.
+- The API key itself is **not** stored in the profile. Export it as the
+  environment variable named by `env_key` (e.g. `export DEEPSEEK_API_KEY=sk-...`).
+- Only include `auth.json` for OpenAI/ChatGPT-style logins that Codex reads
+  from `auth.json`. Third-party providers that use `env_key` do not need one.
+- Do **not** set `model_catalog_json` yourself — `codex-switch` manages it. If
+  you want to ship a catalog, drop the file at
+  `<store>/profiles/<name>/model-catalog.json` and `use` will point the live
+  config at it.
+
+### Path B — configure live first, then import
+
+If you'd rather edit `~/.codex/config.toml` in place (adding `model`,
+`model_provider`, and the `[model_providers.<id>]` table) and then snapshot
+it:
+
+```sh
+codex-switch import deepseek --activate
+```
+
+`import` extracts only the managed keys plus the active provider table into a
+new profile.
+
 ## Usage
 
 ```
@@ -127,7 +183,7 @@ codex-switch <command>
   save [name]                            Capture live provider settings into a profile
                                          (defaults to the active profile)
   diff [name]                            Compare a profile against the live config
-  rm (remove) <name> [--force]           Delete a profile (and its installed catalog)
+  rm (remove) <name> [--force]           Delete a profile
   paths                                  Print resolved paths and the store location
 ```
 
@@ -152,8 +208,9 @@ codex-switch list
 
 ### What gets switched vs. kept
 
-Switched (stored per profile): `model`, `model_provider`, the active
-`[model_providers.<id>]` entry, `model_catalog_json`/catalog, and `auth.json`.
+Switched (stored per profile): `model`, `model_provider`, `review_model`, the
+active `[model_providers.<id>]` entry, `model_catalog_json`/catalog, and
+`auth.json`.
 
 Kept in live config (never overwritten): `sandbox_mode`, `approval_policy`,
 `default_permissions`, `[permissions]`, `[projects]` trust entries,
@@ -169,17 +226,6 @@ codex-switch diff          # what changed vs. the active profile?
 codex-switch save          # capture live provider settings into the active profile
 ```
 
-### Recovering from a bad switch
-
-The live auth + config from just before the last `use` are in
-`<store>/backup/`:
-
-```sh
-codex-switch paths
-cp <store>/backup/auth.json   ~/.codex/auth.json
-cp <store>/backup/config.toml ~/.codex/config.toml
-```
-
 ## Notes and edge cases
 
 - **Auth-less profiles.** A profile without `auth.json` removes any stale live
@@ -187,9 +233,10 @@ cp <store>/backup/config.toml ~/.codex/config.toml
 - **Custom provider API keys** are normally supplied via the provider's
   `env_key` environment variable, not `auth.json`; `codex-switch` does not
   manage environment variables.
-- **Catalogs.** A bundled catalog is installed to `$CODEX_HOME/catalogs/<name>.json`
-  and `model_catalog_json` is set to that absolute path. If a profile has no
-  catalog, the live `model_catalog_json` is left as-is.
+- **Catalogs.** When a profile bundles a catalog, live `model_catalog_json`
+  is set to the absolute path of `model-catalog.json` inside the profile
+  directory. If a profile has no catalog, live `model_catalog_json` is left
+  as-is.
 - **Profile names** map to directory names: no `/`, `\`, `..`, `.`, or NUL.
 - **Removing the active profile** requires `--force`.
 
