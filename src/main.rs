@@ -6,11 +6,13 @@ mod state;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
+use crate::profile::FileStatus;
+
 #[derive(Parser)]
 #[command(
     name = "codex-switch",
     version,
-    about = "Snapshot and switch Codex auth.json + config.toml profiles"
+    about = "Switch Codex model/provider/API-key profiles without touching sandbox, approval, or trusted-project settings"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -24,19 +26,24 @@ enum Command {
     List,
     /// Show the currently active profile.
     Current,
-    /// Switch the live Codex config to a profile (backs up current live first).
+    /// Apply a profile's provider/model/auth layer over the live config.
+    ///
+    /// Only `model`, `model_provider`, the profile's `[model_providers.*]`
+    /// entry, `model_catalog_json`, and `auth.json` are changed. Sandbox mode,
+    /// approval policy, trusted projects, and other live settings are kept.
     Use {
         /// Profile name to activate.
         name: String,
     },
-    /// Save the current live config back into a profile.
+    /// Save the current live provider/model/auth settings into a profile.
     ///
-    /// With no name, writes into the active profile. Captures drift.
+    /// With no name, writes into the active profile. Captures the managed
+    /// fields only; sandbox/approval/trusted-project settings are not stored.
     Save {
         /// Profile to overwrite. Defaults to the active profile.
         name: Option<String>,
     },
-    /// Import the current live config as a new profile.
+    /// Import the current live provider/model/auth settings as a new profile.
     Import {
         /// New profile name.
         name: String,
@@ -47,7 +54,7 @@ enum Command {
         #[arg(long)]
         activate: bool,
     },
-    /// Show which files differ between a profile and the live config.
+    /// Show how a profile differs from the live config.
     Diff {
         /// Profile to compare. Defaults to the active profile.
         name: Option<String>,
@@ -121,26 +128,25 @@ fn cmd_use(name: &str) -> Result<()> {
     if !profile::profile_exists(name)? {
         bail!("profile not found: {name}");
     }
-    let snap = profile::read_profile(name)?;
-    if snap.is_empty() {
-        bail!("profile {name:?} has no auth.json or config.toml");
+    let layer = profile::read_profile(name)?;
+    if layer.is_empty() {
+        bail!("profile {name:?} has no auth.json, provider.toml, or model-catalog.json");
     }
 
     // Capture live before touching it so a later step can roll back.
-    let previous_live = profile::read_live()?;
+    let previous_live = profile::capture_live()?;
 
     if let Some(dir) = profile::backup_live()? {
         eprintln!("backed up current live config to {}", dir.display());
     }
 
-    profile::write_live(&snap)?;
+    profile::write_live(name, &layer)?;
 
     // Switching live and recording the active profile must agree. If we can't
     // persist the new active profile, restore live so disk and state stay
-    // consistent rather than leaving `current` pointing at the old profile
-    // while the files are the new one.
+    // consistent.
     if let Err(state_err) = state::set_active(Some(name)) {
-        if let Err(restore_err) = profile::write_live(&previous_live) {
+        if let Err(restore_err) = profile::write_live(name, &previous_live) {
             return Err(state_err.context(format!(
                 "failed to record active profile, and rolling back live config also failed \
                  (live now = {name:?}, state unchanged): {restore_err:#}"
@@ -161,12 +167,12 @@ fn cmd_save(name: Option<&str>) -> Result<()> {
     };
     state::validate_profile_name(&target)?;
 
-    let live = profile::read_live()?;
-    if live.is_empty() {
+    let layer = profile::capture_live()?;
+    if layer.is_empty() {
         bail!("no live Codex config found to save");
     }
-    profile::write_profile(&target, &live)?;
-    println!("saved live config into profile {target}");
+    profile::write_profile(&target, &layer)?;
+    println!("saved live provider settings into profile {target}");
     Ok(())
 }
 
@@ -175,12 +181,12 @@ fn cmd_import(name: &str, force: bool, activate: bool) -> Result<()> {
     if profile::profile_exists(name)? && !force {
         bail!("profile {name:?} already exists; pass --force to overwrite");
     }
-    let live = profile::read_live()?;
-    if live.is_empty() {
+    let layer = profile::capture_live()?;
+    if layer.is_empty() {
         bail!("no live Codex config found to import");
     }
-    profile::write_profile(name, &live)?;
-    println!("imported live config as profile {name}");
+    profile::write_profile(name, &layer)?;
+    println!("imported live provider settings as profile {name}");
     if activate {
         state::set_active(Some(name))?;
         println!("set {name} as active");
@@ -200,14 +206,15 @@ fn cmd_diff(name: Option<&str>) -> Result<()> {
         bail!("profile not found: {target}");
     }
 
-    let prof = profile::read_profile(&target)?;
-    let live = profile::read_live()?;
-
-    let auth = file_status(prof.auth.as_deref(), live.auth.as_deref());
-    let config = file_status(prof.config.as_deref(), live.config.as_deref());
-    println!("auth.json:   {auth}");
-    println!("config.toml: {config}");
-    if matches!(auth, FileStatus::Same) && matches!(config, FileStatus::Same) {
+    let layer = profile::read_profile(&target)?;
+    let result = profile::diff_profile(&target, &layer)?;
+    println!("auth.json:         {}", status_label(&result.auth));
+    println!("provider.toml:     {}", status_label(&result.fragment));
+    println!("model-catalog.json: {}", status_label(&result.catalog));
+    if matches!(result.auth, FileStatus::Same)
+        && matches!(result.fragment, FileStatus::Same)
+        && matches!(result.catalog, FileStatus::Same)
+    {
         println!("profile {target} matches live");
     }
     Ok(())
@@ -231,39 +238,19 @@ fn cmd_paths() -> Result<()> {
     println!("codex home:   {}", paths::codex_home()?.display());
     println!("live auth:    {}", paths::codex_auth_path()?.display());
     println!("live config:  {}", paths::codex_config_path()?.display());
+    println!("catalogs dir: {}", paths::catalogs_dir()?.display());
     println!("store root:   {}", store.display());
     println!("store source: {source}");
     println!("profiles dir: {}", paths::profiles_dir()?.display());
     Ok(())
 }
 
-enum FileStatus {
-    Same,
-    Differs,
-    OnlyProfile,
-    OnlyLive,
-    Neither,
-}
-
-impl std::fmt::Display for FileStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = match self {
-            FileStatus::Same => "same",
-            FileStatus::Differs => "differs",
-            FileStatus::OnlyProfile => "only in profile (missing from live)",
-            FileStatus::OnlyLive => "only in live (missing from profile)",
-            FileStatus::Neither => "absent in both",
-        };
-        f.write_str(s)
-    }
-}
-
-fn file_status(profile: Option<&[u8]>, live: Option<&[u8]>) -> FileStatus {
-    match (profile, live) {
-        (Some(a), Some(b)) if a == b => FileStatus::Same,
-        (Some(_), Some(_)) => FileStatus::Differs,
-        (Some(_), None) => FileStatus::OnlyProfile,
-        (None, Some(_)) => FileStatus::OnlyLive,
-        (None, None) => FileStatus::Neither,
+fn status_label(status: &FileStatus) -> String {
+    match status {
+        FileStatus::Same => "same".to_string(),
+        FileStatus::Differs => "differs".to_string(),
+        FileStatus::OnlyProfile => "only in profile (missing from live)".to_string(),
+        FileStatus::OnlyLive => "only in live (missing from profile)".to_string(),
+        FileStatus::Neither => "absent in both".to_string(),
     }
 }

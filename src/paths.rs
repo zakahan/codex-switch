@@ -21,6 +21,18 @@ pub fn codex_config_path() -> Result<PathBuf> {
     Ok(codex_home()?.join("config.toml"))
 }
 
+/// Directory where per-profile model catalogs are installed, under the live
+/// Codex home. `config.toml`'s `model_catalog_json` points at files here.
+pub fn catalogs_dir() -> Result<PathBuf> {
+    Ok(codex_home()?.join("catalogs"))
+}
+
+/// Live catalog file installed for the named profile:
+/// `$CODEX_HOME/catalogs/<name>.json`.
+pub fn catalog_path(name: &str) -> Result<PathBuf> {
+    Ok(catalogs_dir()?.join(format!("{name}.json")))
+}
+
 /// Where the codex-switch store lives, and why (for diagnostics).
 pub enum StoreSource {
     /// `CODEX_SWITCH_HOME` was set.

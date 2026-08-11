@@ -1,8 +1,8 @@
 [package]
 name = "codex-switch"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Snapshot and switch Codex auth.json + config.toml profiles"
+description = "Switch Codex model/provider/API-key profiles without touching sandbox, approval, or trusted-project settings"
 license = "MIT"
 
 [[bin]]
@@ -15,6 +15,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dirs = "5"
 anyhow = "1"
+toml_edit = "0.22"
 
 [profile.release]
 strip = true
