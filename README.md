@@ -1,226 +1,262 @@
 # codex-switch
 
-A tiny Linux CLI to snapshot and switch [Codex](https://github.com/openai/codex)
-credentials. It maintains multiple copies of your `~/.codex/auth.json` +
-`~/.codex/config.toml` as named **profiles** and swaps them in and out with a
-single command.
+A tiny Linux CLI to switch [Codex](https://github.com/openai/codex)
+**model / provider / API-key identities** without disturbing the rest of your
+live config.
 
-Think of it as a snapshot manager for your Codex config: each profile is a
-complete, self-contained copy of the two files, and switching atomically
-replaces the live files with the profile's version.
+Most Codex settings are personal/environment preferences — sandbox mode,
+approval policy, which directories you trust, MCP servers — and you do *not*
+want those to change when you switch between, say, your OpenAI account and a
+third-party provider. `codex-switch` stores only the pieces that describe a
+provider identity and merges them over your live `config.toml`, leaving
+everything else (including comments and formatting) untouched.
 
 It is inspired by [cc-switch](https://github.com/farion1231/cc-switch) (a Tauri
 desktop app), but is Codex-only, CLI-only, single-binary, and has no runtime
-dependencies. Adding/editing providers is done by hand — this tool only handles
-storing and switching snapshots.
+dependencies. Provider setup is done by hand — this tool only captures and
+applies provider layers.
 
-## Why
+## What a profile owns
 
-- **cc-switch has no Linux CLI.** This fills that gap for Codex.
-- You keep several Codex setups (official ChatGPT login, a third-party
-  provider, a work key, a personal key, …) and want to flip between them without
-  hand-editing `auth.json` / `config.toml` each time.
+A profile is a directory under `<store>/profiles/<name>/` containing:
 
-## How it works
+- `auth.json` (optional) — OpenAI/ChatGPT credentials, always written `0600`.
+- `config.provider.toml` — a TOML fragment of the managed top-level keys:
+  `model`, `model_provider`, `review_model`, and the active
+  `[model_providers.<id>]` table.
+- `model-catalog.json` (optional) — a model catalog. Treated the same way as
+  `auth.json`: on `use` it is written to the fixed live path
+  `~/.codex/model-catalog.json` (or removed there if the target profile has
+  no catalog), and `model_catalog_json` in the live config is set / cleared
+  accordingly.
+
+Everything else in `~/.codex/config.toml` — `sandbox_mode`, `approval_policy`,
+`[projects]` trust decisions, `[permissions]`, `mcp_servers`, ... — is **not**
+stored and is left in place when you switch.
 
 ```
 ~/.codex/                      # the LIVE config that Codex actually reads
   auth.json
-  config.toml
+  config.toml                  # model_catalog_json points at ./model-catalog.json
+  model-catalog.json           # written/removed by `use`, same treatment as auth.json
 
-<store>/                       # codex-switch's storage (see "Where things live")
+<store>/                       # codex-switch's storage — one dir per profile
   profiles/
     work/
-      auth.json                # a full snapshot of both files
-      config.toml
+      auth.json
+      config.provider.toml
     personal/
       auth.json
-      config.toml
-  backup/                      # last live config, saved before each `use`
-    auth.json
-    config.toml
+      config.provider.toml
+      model-catalog.json
   state.json                   # { "active": "<profile>" }
 ```
 
-- A **profile** is just a directory holding a copy of the two files.
-- **Switching** (`use`) writes the profile's files over the live ones.
-- It is a **pure snapshot** model: after switching, edits you make to the live
-  files are *not* automatically pushed back into the profile. Use `save` to
-  capture such changes (drift) back into a profile.
+> v0.1.0 (tag `v0.1.0`) was a whole-file snapshot tool. v0.2.0 replaced that
+> with field-level layers; snapshot mode was removed.
+
+## Why
+
+- **cc-switch has no Linux CLI.** This fills that gap for Codex.
+- You keep several Codex provider identities (official ChatGPT login, a
+  third-party provider, a work key, a personal key) and want to flip the model /
+  provider / API key / catalog between them while keeping your sandbox,
+  approval, and trusted-directory settings constant.
+
+## How it works
+
+- `import`/`save` read the live config and **extract** the managed keys plus the
+  active `[model_providers.<id>]` table. `auth.json` and `model-catalog.json`
+  are captured from their fixed live paths (`~/.codex/auth.json`,
+  `~/.codex/model-catalog.json`).
+- `use` parses the live `config.toml` with [`toml_edit`](https://crates.io/crates/toml_edit),
+  merges the profile fragment over it (scalars replaced, `model_providers`
+  merged per provider id so unrelated custom providers survive), and writes
+  the result back atomically. `auth.json` and `model-catalog.json` are
+  overwritten (or removed) at their fixed live paths, and `model_catalog_json`
+  in `config.toml` is synthesized / cleared accordingly. Live writes happen
+  in order: auth, catalog, config. If any write fails all three are rolled
+  back to their pre-write bytes.
 
 ### Safety properties
 
 - **Atomic writes.** Each file is written to a temp file in the same directory
   and then `rename`d over the target, so Codex never sees a half-written file.
 - **Paired write with rollback.** `auth.json` is written first, then
-  `config.toml`; if the second write fails, the first is rolled back so you are
-  never left with a mismatched pair.
-- **Credential permissions.** `auth.json` is always written with `0600`
-  (owner read/write only).
-- **Automatic backup.** Before every `use`, the current live config is copied to
-  `<store>/backup/` so a bad switch is recoverable.
-- **Symlink-safe.** Works correctly when `$HOME` (or `~/.codex`) is a symlink —
-  writes resolve through the link to the real file.
+  `~/.codex/model-catalog.json`, then `config.toml`; if any write fails all
+  three are restored to their pre-write bytes.
+- **Least-privilege credentials.** `auth.json` is always written with `0600`.
+- **Symlink-safe.** Works when `$HOME` or `~/.codex` is a symlink.
+- **No network.** This tool never contacts the network.
 
 ## Where things live
 
-**Live files** — resolved from `CODEX_HOME` if set, otherwise `~/.codex`:
+**Live files** — from `CODEX_HOME` if set, otherwise `~/.codex`:
 
 - `$CODEX_HOME/auth.json`
 - `$CODEX_HOME/config.toml`
+- `$CODEX_HOME/model-catalog.json` (present only when the active profile
+  bundles one)
 
-**The store** — resolved in this order:
+**The store** is resolved in this order:
 
 1. `$CODEX_SWITCH_HOME`, if set.
 2. An existing `~/.codex-switch` or `$XDG_DATA_HOME/codex-switch`.
-3. `~/.codex-switch`, if your home directory is writable.
-4. `$XDG_DATA_HOME/codex-switch` (defaults to `~/.local/share/codex-switch`)
-   as a fallback when home is read-only.
+3. `~/.codex-switch`, if home is writable.
+4. `$XDG_DATA_HOME/codex-switch` (default `~/.local/share/codex-switch`) as a
+   fallback for read-only homes.
 
-The fallback matters on setups where the home directory is a **read-only mount**
-(e.g. `~` is a symlink into a read-only filesystem). Run `codex-switch paths` to
-see exactly what is being used and why.
-
-To pin the store to an explicit location:
-
-```sh
-export CODEX_SWITCH_HOME="$HOME/.local/share/codex-switch"
-```
+Run `codex-switch paths` to see exactly what is used and why.
 
 ## Install
 
-Requires a Rust toolchain (`cargo`). Don't have one? Install via
-[rustup](https://rustup.rs):
-
-```sh
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-```
-
-### Recommended: install as a global command
-
-From the repo root, this compiles and installs a `codex-switch` binary into
-`~/.cargo/bin`, which rustup already puts on your `PATH`:
+Requires a Rust toolchain. From the repo root:
 
 ```sh
 cargo install --path .
 ```
 
-After that you can run `codex-switch` from anywhere — no need to be in the repo:
+This installs a `codex-switch` binary into `~/.cargo/bin` (already on `PATH`
+with rustup). Re-run after pulling to update.
 
-```sh
-codex-switch --version
+## Creating a profile (manual)
+
+`codex-switch` intentionally has **no provider setup UI, no templates, no
+wizards** — its job is capture + apply. So the first profile has to be written
+by hand. There are two paths; pick one.
+
+### Path A — write the profile directory directly
+
+Create `<store>/profiles/<name>/config.provider.toml` with the managed keys
+for your provider. Minimal example for a DeepSeek-style OpenAI-compatible API:
+
+```toml
+# ~/.codex-switch/profiles/deepseek/config.provider.toml
+model = "deepseek-chat"
+model_provider = "deepseek"
+review_model = "deepseek-chat"
+
+[model_providers.deepseek]
+name = "DeepSeek"
+base_url = "https://api.deepseek.com"
+env_key = "DEEPSEEK_API_KEY"
+wire_api = "chat"
 ```
 
-To update after pulling new changes, run `cargo install --path .` again (it
-overwrites the installed binary). To uninstall: `cargo uninstall codex-switch`.
-
-### Alternative: build and copy the binary
-
-If you'd rather not use `cargo install`:
+Then activate it:
 
 ```sh
-cargo build --release
-install -Dm755 target/release/codex-switch ~/.local/bin/codex-switch
+codex-switch use deepseek
 ```
 
-Make sure the target directory is on your `PATH`. For `~/.local/bin`, add this
-to your `~/.bashrc` / `~/.zshrc` if it isn't already:
+Notes:
+
+- The provider id (`deepseek` in `[model_providers.deepseek]`) **must match**
+  `model_provider`.
+- `base_url` should not have a trailing slash.
+- `wire_api` is `"chat"` for OpenAI-compatible `/chat/completions` endpoints,
+  or `"responses"` for OpenAI's Responses API.
+- The API key itself is **not** stored in the profile. Export it as the
+  environment variable named by `env_key` (e.g. `export DEEPSEEK_API_KEY=sk-...`).
+- Only include `auth.json` for OpenAI/ChatGPT-style logins that Codex reads
+  from `auth.json`. Third-party providers that use `env_key` do not need one.
+- Do **not** set `model_catalog_json` yourself — `codex-switch` manages it. If
+  you want to ship a catalog, drop the file at
+  `<store>/profiles/<name>/model-catalog.json`. On `use` its bytes are copied
+  to `~/.codex/model-catalog.json` and `model_catalog_json` in the live config
+  is pointed at that fixed path.
+
+### Path B — configure live first, then import
+
+If you'd rather edit `~/.codex/config.toml` in place (adding `model`,
+`model_provider`, and the `[model_providers.<id>]` table) and then snapshot
+it:
 
 ```sh
-export PATH="$HOME/.local/bin:$PATH"
+codex-switch import deepseek --activate
 ```
+
+`import` extracts only the managed keys plus the active provider table into a
+new profile.
 
 ## Usage
 
 ```
 codex-switch <command>
 
-Commands:
-  import <name> [--activate] [--force]   Save the current live config as a new profile
+  import <name> [--activate] [--force]   Capture live provider settings as a new profile
   list (ls)                              List profiles; the active one is marked with *
   current                                Print the active profile name
-  use <name>                             Switch the live config to <name> (backs up live first)
-  save [name]                            Write the current live config back into a profile
+  use <name>                             Merge a profile's layer over the live config
+  save [name]                            Capture live provider settings into a profile
                                          (defaults to the active profile)
-  diff [name]                            Show which files differ between a profile and live
-                                         (defaults to the active profile)
+  diff [name]                            Compare a profile against the live config
   rm (remove) <name> [--force]           Delete a profile
   paths                                  Print resolved paths and the store location
-```
-
-### First-time setup
-
-Capture whatever Codex config you have right now as your first profile:
-
-```sh
-codex-switch import default --activate
 ```
 
 ### Typical workflow
 
 ```sh
-# 1. Snapshot your current setup.
+# 1. Capture your current provider setup.
 codex-switch import work --activate
 
-# 2. Manually edit ~/.codex/auth.json and ~/.codex/config.toml for another setup
-#    (switch provider, swap the API key, etc.), then snapshot that too.
+# 2. Edit ~/.codex/config.toml + auth.json for another provider (model, base_url,
+#    API key, optionally drop a model-catalog.json in place), then capture that
+#    too.
 codex-switch import personal
 
-# 3. Flip between them anytime.
+# 3. Flip between them. Sandbox/approval/trusted-project settings are untouched.
 codex-switch use work
 codex-switch use personal
 
-# See what you have; the active one is starred.
 codex-switch list
 # * personal
 #   work
-
-codex-switch current
-# personal
 ```
+
+### What gets switched vs. kept
+
+Switched (stored per profile): `model`, `model_provider`, `review_model`, the
+active `[model_providers.<id>]` entry, `auth.json`, and `model-catalog.json`
+(the last two are captured from and written to their fixed live paths).
+`model_catalog_json` in `config.toml` is synthesized on `use` and is not
+stored in the profile.
+
+Kept in live config (never overwritten): `sandbox_mode`, `approval_policy`,
+`default_permissions`, `[permissions]`, `[projects]` trust entries,
+`mcp_servers`, and all other unmanaged keys.
 
 ### Capturing drift
 
-Because this is a pure-snapshot tool, changes you make to the live files after
-switching are not tracked automatically. To fold them back into the active
-profile:
+Changes to the live provider settings after switching are not tracked
+automatically. Fold them back with:
 
 ```sh
 codex-switch diff          # what changed vs. the active profile?
-# auth.json:   same
-# config.toml: differs
-codex-switch save          # write live back into the active profile
-```
-
-`save <name>` targets a specific profile instead of the active one.
-
-### Recovering from a bad switch
-
-The live config from just before your last `use` is in `<store>/backup/`. Find
-the store with `codex-switch paths`, then copy the files back:
-
-```sh
-codex-switch paths        # note "store root"
-cp <store>/backup/auth.json   ~/.codex/auth.json
-cp <store>/backup/config.toml ~/.codex/config.toml
+codex-switch save          # capture live provider settings into the active profile
 ```
 
 ## Notes and edge cases
 
-- **Config-only profiles.** If a profile has a `config.toml` but no `auth.json`
-  (e.g. a third-party provider that authenticates via `config.toml`), switching
-  to it will *remove* any stale live `auth.json` so the live state matches the
-  snapshot exactly. Switching back to a profile that has `auth.json` restores it.
+- **Auth-less profiles.** A profile without `auth.json` removes any stale live
+  `auth.json` on `use`. Switching back to a profile that has one restores it.
+- **Custom provider API keys** are normally supplied via the provider's
+  `env_key` environment variable, not `auth.json`; `codex-switch` does not
+  manage environment variables.
+- **Catalogs.** When the active profile bundles a `model-catalog.json`, its
+  bytes are written to `~/.codex/model-catalog.json` and live
+  `model_catalog_json` points at that fixed path. Switching to a profile that
+  has no catalog removes `~/.codex/model-catalog.json` and drops
+  `model_catalog_json` from `config.toml`, exactly the way `auth.json` is
+  handled.
 - **Profile names** map to directory names: no `/`, `\`, `..`, `.`, or NUL.
-- **Removing the active profile** requires `--force`; afterwards there is no
-  active profile (the live files are left untouched).
-- This tool never contacts the network and never edits the *contents* of your
-  config — it only copies whole files around.
+- **Removing the active profile** requires `--force`.
 
 ## Environment variables
 
-| Variable            | Purpose                                             |
-| ------------------- | --------------------------------------------------- |
-| `CODEX_HOME`        | Location of the live Codex config (default `~/.codex`). |
-| `CODEX_SWITCH_HOME` | Force the store location.                            |
+| Variable            | Purpose                                                  |
+| ------------------- | -------------------------------------------------------- |
+| `CODEX_HOME`        | Location of the live Codex config (default `~/.codex`).   |
+| `CODEX_SWITCH_HOME` | Force the store location.                                |
 | `XDG_DATA_HOME`     | Base for the XDG fallback store (default `~/.local/share`). |

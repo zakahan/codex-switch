@@ -4,25 +4,44 @@ Guidance for AI agents and contributors working on this repository.
 
 ## What this is
 
-`codex-switch` is a single-binary Linux CLI that snapshots and switches
-[Codex](https://github.com/openai/codex) credentials. Each **profile** is a
-directory holding a complete copy of `~/.codex/auth.json` and
-`~/.codex/config.toml`; switching atomically replaces the live files with a
-profile's copy. It is a **pure snapshot** tool — it copies whole files, never
-edits their contents, and never touches the network.
+`codex-switch` is a single-binary Linux CLI that switches
+[Codex](https://github.com/openai/codex) **model/provider/API-key identities**
+without disturbing the rest of the live config. Each **profile** is a *layer*
+owning only:
 
-Scope is deliberately small: store + switch. Provider setup is done by hand.
-Do not add provider management, config templating, TOML/JSON content merging,
-MCP/proxy features, or a GUI. The reference app under `ref/cc-switch/` has all
-of that; we intentionally left it out.
+- `auth.json` (optional, OpenAI/ChatGPT credentials),
+- `config.provider.toml` — a TOML fragment of the managed top-level keys
+  (`model`, `model_provider`, `review_model`) plus the active
+  `[model_providers.<id>]` table,
+- `model-catalog.json` (optional). Treated the same way as `auth.json`: on
+  apply it is written to the fixed live path `~/.codex/model-catalog.json`
+  (and removed there if the target profile has no catalog). The
+  `model_catalog_json` key in the live config is synthesized to point at that
+  fixed path; the profile never stores a catalog path.
+
+Switching **merges** the fragment into the current live `config.toml` with
+`toml_edit`, so settings the profile does not own — sandbox mode, approval
+policy, trusted projects under `[projects]`, MCP servers, etc. — are left
+exactly as they are (comments and formatting preserved). The tool never touches
+the network.
+
+Scope is deliberately small: capture + apply a provider layer. Provider setup
+is done by hand. Do not add provider management UI, config templating beyond
+the documented managed keys, MCP/proxy features, or a GUI. The reference app
+under `ref/cc-switch/` has all of that; we intentionally left it out.
+
+> Historical note: v0.1.0 was a whole-file snapshot tool (tag `v0.1.0`). v0.2.0
+> replaced snapshots with field-level layers; snapshot mode was intentionally
+> removed. The store shape is unchanged: one directory per profile under
+> `<store>/profiles/<name>/`.
 
 ## Layout
 
 ```
 src/
   main.rs      # clap CLI: list, current, use, save, import, diff, rm, paths
-  paths.rs     # resolve live files (CODEX_HOME) and the store (with fallback)
-  profile.rs   # snapshot read/write, paired write + rollback, backup, remove
+  paths.rs     # resolve live files (CODEX_HOME) and store (with fallback)
+  profile.rs   # layer capture/merge (toml_edit), rollback, remove
   state.rs     # state.json (active profile) + profile-name validation
   atomic.rs    # atomic_write: temp file in same dir -> rename, perms handling
 ref/cc-switch/ # read-only reference (the Tauri app this is inspired by). Do not edit.
@@ -33,17 +52,38 @@ ref/cc-switch/ # read-only reference (the Tauri app this is inspired by). Do not
 - **Atomic writes.** All file writes go through `atomic::atomic_write` (temp file
   in the *same directory*, then `rename`). Never write a target path in place.
   Same-directory temp keeps the rename on one filesystem and symlink-safe.
-- **Paired write with rollback.** `auth.json` is written before `config.toml`;
-  if `config.toml` fails, `auth.json` (and `config.toml`) are restored to their
-  pre-write bytes. See `profile::write_pair`. Keep this ordering and rollback.
+- **Layer, not snapshot.** A profile only touches the managed keys
+  (`model`, `model_provider`, `review_model`, and its own
+  `[model_providers.<id>]` entry) plus the paired `auth.json` and
+  `model-catalog.json` live files. `merge_fragment` must never rewrite or
+  reorder unmanaged sections; it edits the live `DocumentMut` in place and
+  leaves everything else (sandbox, approval, `[projects]` trust, MCP) intact.
+  The `model_providers` map is merged per provider id so unrelated custom
+  providers in live config are preserved.
+- **Catalog is a paired live file, not a stored path.** `model-catalog.json`
+  is captured from and written to the fixed live path
+  `~/.codex/model-catalog.json` — exactly the same shape as `auth.json`. On
+  apply the file is overwritten (or removed if the profile has none) and
+  `model_catalog_json` in `config.toml` is synthesized to point at that fixed
+  path, or removed. `model_catalog_json` is *not* a managed fragment key: the
+  fragment never carries a path, so profiles cannot go stale by pointing at a
+  moved catalog.
+- **Paired write with rollback.** `auth.json` is written first, then
+  `~/.codex/model-catalog.json`, then `config.toml`. If any write fails all
+  three files are restored to their pre-write bytes. See `profile::write_live`.
 - **`auth.json` is `0600`.** It holds credentials. `AUTH_MODE` enforces this on
-  every write, including profiles and backups.
-- **`None` means "remove".** In a `Snapshot`, a `None` field means the file is
-  absent; applying it deletes the corresponding target so live matches the
-  snapshot exactly (e.g. config-only profiles clear a stale live `auth.json`).
-- **Pure snapshot.** Never auto-write live changes back into a profile. Drift is
-  captured only by an explicit `save`.
-- **Backup before `use`.** Every `use` first copies live to `<store>/backup/`.
+  every write, including profile copies.
+- **`None` means "remove".** A `None`/absent optional file in a layer means the
+  corresponding live file is removed (an auth-less profile clears a stale
+  live `auth.json`, a catalog-less profile clears the live
+  `model-catalog.json` and drops `model_catalog_json` from `config.toml`).
+  `config.provider.toml`, `auth.json`, and `model-catalog.json` follow the
+  same rule inside the profile directory.
+- **No auto-save.** Never auto-write live changes back into a profile. Drift is
+  captured only by an explicit `save`/`import`.
+- **No side backup.** `use` does not copy live files anywhere before writing.
+  Recovery is via `save`/`use` between profiles; rollback covers the failure
+  window of a single `use`.
 - **Name validation.** Profile names are directory names. Reject empty, `.`,
   `..`, and anything containing `/`, `\`, or NUL (`state::validate_profile_name`).
 
@@ -69,25 +109,32 @@ There is no unit-test suite yet. Verify changes end-to-end against an **isolated
 sandbox** so you never clobber the real `~/.codex`:
 
 ```sh
-export CODEX_HOME=/tmp/cs-test/.codex
-export CODEX_SWITCH_HOME=/tmp/cs-test/.codex-switch
-rm -rf /tmp/cs-test && mkdir -p "$CODEX_HOME"
+T=$(mktemp -d)
+export CODEX_HOME="$T/.codex"
+export CODEX_SWITCH_HOME="$T/.codex-switch"
+mkdir -p "$CODEX_HOME"
 printf '{"OPENAI_API_KEY":"sk-a"}\n' > "$CODEX_HOME/auth.json"
-printf 'model="gpt-5"\n'            > "$CODEX_HOME/config.toml"
+printf 'model="gpt-5"\nsandbox_mode="read-only"\n' > "$CODEX_HOME/config.toml"
 
-codex-switch import a --activate
+codex-switch import a
 codex-switch use a
 codex-switch diff
 codex-switch save
 codex-switch list
 ```
 
+When testing, confirm the layer promise: after `use`, unmanaged keys such as
+`sandbox_mode`, `approval_policy`, and `[projects.*]` trust entries that were
+in the live config are still present unchanged.
+
 Always test with `CODEX_HOME`/`CODEX_SWITCH_HOME` pointed at a temp dir. Never
 run mutating commands against the real store while developing.
 
 ## Style
 
-- Keep it dependency-light: `clap`, `serde`, `serde_json`, `dirs`, `anyhow`.
+- Keep it dependency-light: `clap`, `serde`, `serde_json`, `dirs`, `anyhow`,
+  `toml_edit`. `toml_edit` (not `toml`) is required so merges preserve
+  formatting and comments.
 - Errors use `anyhow` with `.context(...)`; user-facing messages are printed by
   `main` and the process exits non-zero on error.
 - Comments explain *why*, not *what*. The build must stay warning-free.
