@@ -26,15 +26,14 @@ const CATALOG_FILE: &str = "model-catalog.json";
 /// A profile is a *layer*, not a snapshot. It carries only the pieces that
 /// describe a model/provider identity:
 ///
-/// - `auth`:     optional `auth.json` bytes (OpenAI/ChatGPT credentials),
+/// - `auth`: optional `auth.json` bytes (OpenAI/ChatGPT credentials).
 /// - `fragment`: a TOML fragment owning the top-level provider/model keys
-///               (`model`, `model_provider`, `review_model`) and the matching
-///               `[model_providers.<id>]` table,
-/// - `catalog`:  optional model-catalog JSON. On apply this is written to the
-///               fixed live path `~/.codex/model-catalog.json` and
-///               `model_catalog_json` in the live config points at that file
-///               — the same treatment `auth.json` gets. No path is stored in
-///               the fragment.
+///   (`model`, `model_provider`, `review_model`) and the matching
+///   `[model_providers.<id>]` table.
+/// - `catalog`: optional model-catalog JSON. On apply this is written to the
+///   fixed live path `~/.codex/model-catalog.json` and `model_catalog_json`
+///   in the live config points at that file — the same treatment `auth.json`
+///   gets. No path is stored in the fragment.
 ///
 /// Everything else in the live `config.toml` (sandbox, approval policy,
 /// trusted projects under `[projects]`, MCP servers, ...) is left untouched
