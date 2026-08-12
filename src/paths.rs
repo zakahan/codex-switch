@@ -21,6 +21,13 @@ pub fn codex_config_path() -> Result<PathBuf> {
     Ok(codex_home()?.join("config.toml"))
 }
 
+/// Live `~/.codex/model-catalog.json`. codex-switch manages this file the same
+/// way it manages `auth.json`: profile catalog overwrites it, an auth-less /
+/// catalog-less profile removes it.
+pub fn codex_catalog_path() -> Result<PathBuf> {
+    Ok(codex_home()?.join("model-catalog.json"))
+}
+
 /// Where the codex-switch store lives, and why (for diagnostics).
 pub enum StoreSource {
     /// `CODEX_SWITCH_HOME` was set.

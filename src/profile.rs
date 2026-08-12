@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use toml_edit::{value, DocumentMut, Item};
@@ -28,11 +28,13 @@ const CATALOG_FILE: &str = "model-catalog.json";
 ///
 /// - `auth`:     optional `auth.json` bytes (OpenAI/ChatGPT credentials),
 /// - `fragment`: a TOML fragment owning the top-level provider/model keys
-///               (`model`, `model_provider`, and the matching
-///               `[model_providers.<id>]` table),
-/// - `catalog`:  optional model-catalog JSON that lives *inside* the profile
-///               directory; the live `model_catalog_json` is repointed at
-///               that file on apply — no separate install copy.
+///               (`model`, `model_provider`, `review_model`) and the matching
+///               `[model_providers.<id>]` table,
+/// - `catalog`:  optional model-catalog JSON. On apply this is written to the
+///               fixed live path `~/.codex/model-catalog.json` and
+///               `model_catalog_json` in the live config points at that file
+///               — the same treatment `auth.json` gets. No path is stored in
+///               the fragment.
 ///
 /// Everything else in the live `config.toml` (sandbox, approval policy,
 /// trusted projects under `[projects]`, MCP servers, ...) is left untouched
@@ -79,12 +81,13 @@ fn read_live_config() -> Result<DocumentMut> {
 }
 
 /// Top-level config keys that a profile is allowed to manage.
-const MANAGED_KEYS: [&str; 4] = [
-    "model",
-    "model_provider",
-    "model_catalog_json",
-    "review_model",
-];
+///
+/// `model_catalog_json` is *not* in this list: catalog presence is expressed
+/// by the profile bundling a `model-catalog.json`. On apply the live
+/// `~/.codex/model-catalog.json` is overwritten (or removed) and the key is
+/// synthesized/removed accordingly — we never store a stale path in the
+/// fragment.
+const MANAGED_KEYS: [&str; 3] = ["model", "model_provider", "review_model"];
 
 /// Extract the managed subset of a config document into a standalone
 /// fragment. The active provider's `[model_providers.<id>]` table is pulled in
@@ -135,26 +138,16 @@ fn merge_fragment(doc: &mut DocumentMut, fragment: &DocumentMut) {
     }
 }
 
-/// Capture the live config as a layer. If `model_catalog_json` points at a
-/// readable file, its bytes are bundled into the layer and the path key is
-/// dropped from the fragment (it is re-pointed at the installed copy on use).
+/// Capture the live config as a layer.
+///
+/// `model-catalog.json` is captured from the fixed live path
+/// `~/.codex/model-catalog.json` (same shape as `auth.json`). The fragment
+/// never carries `model_catalog_json`: that key is derived on apply from the
+/// presence of the bundled catalog.
 pub fn capture_live() -> Result<ProfileLayer> {
     let auth = read_optional(&paths::codex_auth_path()?)?;
-    let mut fragment = extract_fragment(&read_live_config()?);
-
-    let catalog = match fragment
-        .get("model_catalog_json")
-        .and_then(|i| i.as_str())
-        .map(PathBuf::from)
-    {
-        Some(p) if p.is_file() => {
-            let bytes =
-                fs::read(&p).with_context(|| format!("failed to read catalog: {}", p.display()))?;
-            fragment.remove("model_catalog_json");
-            Some(bytes)
-        }
-        _ => None,
-    };
+    let fragment = extract_fragment(&read_live_config()?);
+    let catalog = read_optional(&paths::codex_catalog_path()?)?;
 
     Ok(ProfileLayer {
         auth,
@@ -246,17 +239,23 @@ fn restore_file(path: &Path, content: Option<&[u8]>, mode: Option<u32>) -> Resul
 ///
 /// The fragment is merged into the *current* live `config.toml`, so settings
 /// the profile does not own (sandbox, approval, trusted projects, ...) are
-/// preserved. If the profile bundles a catalog, `model_catalog_json` is
-/// pointed at the file *inside the profile directory* — Codex reads it from
-/// there directly, we do not install a copy elsewhere.
+/// preserved.
 ///
-/// auth.json is written before config.toml; if the config write fails both
-/// files are rolled back to their pre-write bytes.
-pub fn write_live(name: &str, layer: &ProfileLayer) -> Result<()> {
+/// `model-catalog.json` is treated exactly like `auth.json`: written to the
+/// fixed live path `~/.codex/model-catalog.json` (or removed there if the
+/// profile has none). The `model_catalog_json` key is synthesized to point at
+/// that fixed path when a catalog is present, and removed from the config
+/// otherwise. The profile never stores a catalog path — only the file bytes.
+///
+/// Live writes happen in order: auth, catalog, config. If the config write
+/// fails, all three files are rolled back to their pre-write bytes.
+pub fn write_live(_name: &str, layer: &ProfileLayer) -> Result<()> {
     let auth_path = paths::codex_auth_path()?;
+    let catalog_path = paths::codex_catalog_path()?;
     let config_path = paths::codex_config_path()?;
 
     let old_auth = read_optional(&auth_path)?;
+    let old_catalog = read_optional(&catalog_path)?;
     let old_config = read_optional(&config_path)?;
 
     // Build the merged config up front so a parse/IO failure here happens
@@ -269,8 +268,9 @@ pub fn write_live(name: &str, layer: &ProfileLayer) -> Result<()> {
         merge_fragment(&mut doc, fragment);
     }
     if layer.catalog.is_some() {
-        let catalog_path = paths::profile_dir(name)?.join(CATALOG_FILE);
         doc["model_catalog_json"] = value(catalog_path.display().to_string());
+    } else {
+        doc.remove("model_catalog_json");
     }
     let new_config = doc.to_string();
 
@@ -278,6 +278,12 @@ pub fn write_live(name: &str, layer: &ProfileLayer) -> Result<()> {
         let mut rollback_errs = Vec::new();
         if let Err(e) = restore_file(&auth_path, old_auth.as_deref(), AUTH_MODE) {
             rollback_errs.push(format!("could not restore {}: {e:#}", auth_path.display()));
+        }
+        if let Err(e) = restore_file(&catalog_path, old_catalog.as_deref(), None) {
+            rollback_errs.push(format!(
+                "could not restore {}: {e:#}",
+                catalog_path.display()
+            ));
         }
         if let Err(e) = restore_file(&config_path, old_config.as_deref(), None) {
             rollback_errs.push(format!(
@@ -298,6 +304,9 @@ pub fn write_live(name: &str, layer: &ProfileLayer) -> Result<()> {
     if let Err(e) = sync_file(&auth_path, layer.auth.as_deref(), AUTH_MODE) {
         return rollback(e.context(format!("failed to write {}", auth_path.display())));
     }
+    if let Err(e) = sync_file(&catalog_path, layer.catalog.as_deref(), None) {
+        return rollback(e.context(format!("failed to write {}", catalog_path.display())));
+    }
     if let Err(e) = atomic_write(&config_path, new_config.as_bytes(), None) {
         return rollback(e.context(format!("failed to write {}", config_path.display())));
     }
@@ -305,8 +314,10 @@ pub fn write_live(name: &str, layer: &ProfileLayer) -> Result<()> {
 }
 
 /// Remove a profile directory. Refuses if it is the active profile unless
-/// forced. The bundled catalog lives inside the directory, so a plain
-/// recursive remove is all that is needed.
+/// forced. All profile files (auth, fragment, catalog) live inside the
+/// directory, so a plain recursive remove is all that is needed. The live
+/// `~/.codex/model-catalog.json` is *not* touched here — switching to a
+/// different profile (or one without a catalog) is what clears it.
 pub fn remove_profile(name: &str, force: bool) -> Result<()> {
     if !profile_exists(name)? {
         bail!("profile not found: {name}");
@@ -367,28 +378,18 @@ pub fn diff_profile(layer: &ProfileLayer) -> Result<DiffResult> {
     let live_auth = read_optional(&paths::codex_auth_path()?)?;
     let auth = byte_status(layer.auth.as_deref(), live_auth.as_deref());
 
-    // The live catalog is whatever `model_catalog_json` currently points at,
-    // read directly from that path (no side-copy in $CODEX_HOME/catalogs/).
-    let live_doc = read_live_config()?;
-    let live_catalog = match live_doc
-        .get("model_catalog_json")
-        .and_then(|i| i.as_str())
-        .map(PathBuf::from)
-    {
-        Some(p) if p.is_file() => read_optional(&p)?,
-        _ => None,
-    };
+    // Catalog lives at the fixed live path, the same way auth.json does.
+    let live_catalog = read_optional(&paths::codex_catalog_path()?)?;
     let catalog = byte_status(layer.catalog.as_deref(), live_catalog.as_deref());
 
     // Compare the profile fragment against the managed subset extracted from
-    // live. A bundled catalog owns model_catalog_json, so exclude that key
-    // from the live extract when comparing.
+    // live. `model_catalog_json` is not in `MANAGED_KEYS`, so neither side
+    // carries it here — catalog presence is diffed via the byte comparison
+    // above.
+    let live_doc = read_live_config()?;
     let fragment = match &layer.fragment {
         Some(prof_frag) => {
-            let mut live_frag = extract_fragment(&live_doc);
-            if layer.catalog.is_some() {
-                live_frag.remove("model_catalog_json");
-            }
+            let live_frag = extract_fragment(&live_doc);
             if docs_equal(prof_frag, &live_frag) {
                 FileStatus::Same
             } else {
