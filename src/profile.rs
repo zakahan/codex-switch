@@ -115,24 +115,36 @@ fn extract_fragment(doc: &DocumentMut) -> DocumentMut {
 
 /// Merge a profile fragment into the live config document.
 ///
-/// Scalar managed keys are replaced outright. The `model_providers` map is
-/// merged per provider id so custom providers defined in the live config that
-/// the profile does not mention are preserved.
+/// Managed scalar keys are *owned* by the profile: keys present in the
+/// fragment are written, keys absent from the fragment are removed from live.
+/// Otherwise a partial fragment (e.g. one that only sets `model`) would leave
+/// stale `model_provider` / `review_model` from a previously-applied profile,
+/// which is how you end up pointing at the last provider's endpoint with the
+/// new profile's auth.
+///
+/// The `model_providers` map is merged per provider id so custom providers
+/// defined in the live config that the profile does not mention are preserved.
 fn merge_fragment(doc: &mut DocumentMut, fragment: &DocumentMut) {
-    for (key, item) in fragment.iter() {
-        if key == "model_providers" {
-            if item.as_table_like().is_some() && !doc.contains_table("model_providers") {
-                let mut providers = toml_edit::Table::new();
-                providers.set_implicit(true);
-                doc["model_providers"] = Item::Table(providers);
+    for key in MANAGED_KEYS {
+        match fragment.get(key) {
+            Some(item) => {
+                doc.insert(key, item.clone());
             }
-            if let Some(providers) = item.as_table_like() {
-                for (provider_id, provider_item) in providers.iter() {
-                    doc["model_providers"][provider_id] = provider_item.clone();
-                }
+            None => {
+                doc.remove(key);
             }
-        } else {
-            doc.insert(key, item.clone());
+        }
+    }
+    if let Some(item) = fragment.get("model_providers") {
+        if item.as_table_like().is_some() && !doc.contains_table("model_providers") {
+            let mut providers = toml_edit::Table::new();
+            providers.set_implicit(true);
+            doc["model_providers"] = Item::Table(providers);
+        }
+        if let Some(providers) = item.as_table_like() {
+            for (provider_id, provider_item) in providers.iter() {
+                doc["model_providers"][provider_id] = provider_item.clone();
+            }
         }
     }
 }
