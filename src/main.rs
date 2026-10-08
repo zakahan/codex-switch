@@ -151,6 +151,7 @@ fn cmd_use(name: &str) -> Result<()> {
         return Err(state_err.context("failed to record active profile; rolled back live config"));
     }
     println!("switched to {name}");
+    println!("restart Codex to reload the profile: `codex app-server daemon restart`");
     Ok(())
 }
 

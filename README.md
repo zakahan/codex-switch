@@ -76,7 +76,9 @@ stored and is left in place when you switch.
   overwritten (or removed) at their fixed live paths, and `model_catalog_json`
   in `config.toml` is synthesized / cleared accordingly. Live writes happen
   in order: auth, catalog, config. If any write fails all three are rolled
-  back to their pre-write bytes.
+  back to their pre-write bytes. After a successful switch, the CLI reminds
+  you to run `codex app-server daemon restart` so a running Codex daemon
+  reloads the new profile.
 
 ### Safety properties
 
